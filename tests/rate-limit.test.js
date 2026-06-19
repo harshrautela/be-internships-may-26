@@ -1,36 +1,66 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { setTimeout as wait } from 'node:timers/promises';
-import http from 'node:http';
+import { postJson, startServer, stopServer, tempDb } from './helpers.js';
 
 test('rate limit: allow 5 per minute, 6th is 429', async () => {
-  const proc = spawn('node', ['src/server.js'], { env: { ...process.env, API_KEY: 'k', PORT: '9092', RATE_LIMIT_PER_MIN: '5' } });
-  await wait(300);
+  const port = '9092';
+  const proc = await startServer({
+    API_KEY: 'k',
+    PORT: port,
+    RATE_LIMIT_PER_MIN: '5',
+    DATABASE_URL: tempDb('rate-basic'),
+  });
 
-  const base = 'http://localhost:9092';
-  const statuses = [];
-  for (let i=0;i<6;i++){
-    const code = await postStatus(`${base}/v1/signals`, {
-      headers: { 'x-api-key': 'k' },
-      body: { userId: 'u1', type: 'note', payload: String(i) }
-    });
-    statuses.push(code);
+  try {
+    const base = `http://localhost:${port}`;
+    const statuses = [];
+
+    for (let i = 0; i < 6; i += 1) {
+      const res = await postJson(`${base}/v1/signals`, {
+        headers: { 'x-api-key': 'k' },
+        body: { userId: 'u1', type: 'note', payload: String(i) },
+      });
+      statuses.push(res.statusCode);
+    }
+
+    const counts = statuses.reduce((acc, code) => {
+      acc[code] = (acc[code] || 0) + 1;
+      return acc;
+    }, {});
+
+    assert.equal(counts[201], 5);
+    assert.equal(counts[429], 1);
+  } finally {
+    stopServer(proc);
   }
-  const counts = statuses.reduce((acc,c)=> (acc[c]=(acc[c]||0)+1, acc), {});
-  assert.ok(counts[200] >= 5);
-  assert.ok(counts[429] >= 1);
-  proc.kill();
 });
 
-async function postStatus(url, { headers, body }){
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify(body);
-    const req = http.request(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers } }, (res) => {
-      res.resume();
-      res.on('end', () => resolve(res.statusCode));
-    });
-    req.on('error', reject);
-    req.write(data); req.end();
+test('rate limit is safe under parallel burst for same user', async () => {
+  const port = '9094';
+  const proc = await startServer({
+    API_KEY: 'k',
+    PORT: port,
+    RATE_LIMIT_PER_MIN: '5',
+    DATABASE_URL: tempDb('rate-parallel'),
   });
-}
+
+  try {
+    const base = `http://localhost:${port}`;
+    const responses = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        postJson(`${base}/v1/signals`, {
+          headers: { 'x-api-key': 'k' },
+          body: { userId: 'burst-user', type: 'note', payload: String(i) },
+        }),
+      ),
+    );
+
+    const successCount = responses.filter((r) => r.statusCode === 201).length;
+    const limitedCount = responses.filter((r) => r.statusCode === 429).length;
+
+    assert.equal(successCount, 5);
+    assert.equal(limitedCount, 15);
+  } finally {
+    stopServer(proc);
+  }
+});

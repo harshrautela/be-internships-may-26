@@ -1,34 +1,94 @@
 # Signals Challenge (Node.js + Fastify)
 
-Build a minimal production-leaning service that can **handle load**, **rate limit**, and **avoid duplicates** via idempotency.
+Minimal production-leaning service for creating and listing user signals with API-key auth, atomic idempotency, database-backed rate limiting, and retry/backoff for transient database failures.
 
-## Endpoints (to keep)
-- `POST /v1/signals`
-  - body: `{ "userId": "string", "type": "string", "payload": "string" }`
-  - headers: `X-API-Key`, `Idempotency-Key` (optional)
-  - behaviors:
-    - **Rate limit** per `userId`: `RATE_LIMIT_PER_MIN` per minute (default 5).
-    - **Idempotency**: same `Idempotency-Key` should not create duplicates.
-- `GET /v1/signals?userId=...&limit=...`
-- `GET /healthz`
+## Endpoints
 
-## Your Tasks
-1. **Implement a robust rate limiter** in `src/rateLimit.js`.
-2. **Make idempotency safe across scale** in `src/signals.js`.
-3. **Handle DB failure** gracefully with retry/backoff.
-4. **Think for 10k RPS.** Add a `SCALE.md`.
-5. **Finish the tests** in `tests/*.test.js`.
+### `GET /healthz`
 
-## Deliverables
-- Working service, passing tests, updated README, SCALE.md.
-- Optional deploy link.
----
+Returns service health.
 
-## Extra Production Constraints (must pass)
+```json
+{ "ok": true }
+```
 
-- **Atomic Idempotency:** Survive concurrent requests and restarts. Avoid check-then-insert races; use a DB-level unique constraint or atomic upsert pattern. Return the same resource for identical `Idempotency-Key`.
-- **Concurrency-Safe Rate Limit:** Must behave correctly under burst and parallel calls. Naive in-memory counters that race will fail hidden checks. Explain how this becomes multi-instance safe.
-- **Transient DB Failures:** Implement retry/backoff (with jitter) or circuit breaker when DB errors occur (we simulate via `DB_FAIL_RATE`). No duplicates on retry.
-- **Scale Plan (10k RPS):** Fill `SCALE.md` with a clear, concise approach (indexes, pooling, caching, queues, horizontal scale, idempotency store).
+### `POST /v1/signals`
 
-> We will run additional **hidden concurrency/multi-instance tests** during evaluation.
+Headers:
+
+- `X-API-Key`: required
+- `Idempotency-Key`: optional, but recommended for safe retries
+
+Body:
+
+```json
+{
+  "userId": "u1",
+  "type": "note",
+  "payload": "hello"
+}
+```
+
+Behavior:
+
+- Rate limited per `userId` using `RATE_LIMIT_PER_MIN` per fixed 60-second window.
+- If the same `Idempotency-Key` is used again, the service returns the already-created signal instead of creating a duplicate.
+- New signals return `201`; idempotency replays return `200`.
+- Transient SQLite failures are retried with exponential backoff and jitter.
+
+### `GET /v1/signals?userId=u1&limit=20`
+
+Lists latest signals for one user. `limit` is clamped between `1` and `100`.
+
+## Setup
+
+```bash
+npm install
+cp .env.example .env
+npm run dev
+```
+
+Default `.env` values:
+
+```bash
+API_KEY=change-me
+PORT=8080
+DATABASE_URL=./data/signals.db
+RATE_LIMIT_PER_MIN=5
+DB_FAIL_RATE=0
+DB_RETRY_ATTEMPTS=5
+DB_RETRY_BASE_MS=20
+```
+
+## Test
+
+```bash
+npm test
+```
+
+The tests cover:
+
+- basic idempotency replay
+- concurrent idempotency burst creating only one signal
+- basic rate limit behavior
+- parallel rate limit burst safety
+
+## Quick manual check
+
+```bash
+curl -X POST http://localhost:8080/v1/signals \
+  -H "X-API-Key: change-me" \
+  -H "Idempotency-Key: demo-1" \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"u1","type":"note","payload":"hello"}'
+
+curl "http://localhost:8080/v1/signals?userId=u1&limit=10" \
+  -H "X-API-Key: change-me"
+```
+
+## Implementation notes
+
+- Idempotency is protected by a database-level `UNIQUE` constraint on `signals.idempotency_key`.
+- Creation is done inside a SQLite transaction. If an idempotency key already exists, the existing resource is returned before consuming rate limit.
+- Rate limit counters live in the `rate_limits` table and are updated inside transactions, so parallel requests cannot race an in-memory counter.
+- SQLite runs in WAL mode with a `busy_timeout` to reduce lock-related transient failures.

@@ -1,38 +1,69 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { setTimeout as wait } from 'node:timers/promises';
-import http from 'node:http';
+import { getJson, postJson, startServer, stopServer, tempDb } from './helpers.js';
 
 test('idempotency returns same resource for same key', async () => {
-  const proc = spawn('node', ['src/server.js'], { env: { ...process.env, API_KEY: 'k', PORT: '9091' } });
-  await wait(300);
-
-  const base = 'http://localhost:9091';
-  const idem = 'same-key';
-
-  const a = await postJson(`${base}/v1/signals`, {
-    headers: { 'x-api-key': 'k', 'Idempotency-Key': idem },
-    body: { userId: 'u1', type: 'note', payload: 'x' }
-  });
-  const b = await postJson(`${base}/v1/signals`, {
-    headers: { 'x-api-key': 'k', 'Idempotency-Key': idem },
-    body: { userId: 'u1', type: 'note', payload: 'x' }
+  const port = '9091';
+  const proc = await startServer({
+    API_KEY: 'k',
+    PORT: port,
+    DATABASE_URL: tempDb('idempotency-basic'),
+    RATE_LIMIT_PER_MIN: '100',
   });
 
-  assert.equal(a.id, b.id);
-  assert.equal(a.idempotencyKey, b.idempotencyKey);
-  proc.kill();
+  try {
+    const base = `http://localhost:${port}`;
+    const idem = 'same-key';
+
+    const a = await postJson(`${base}/v1/signals`, {
+      headers: { 'x-api-key': 'k', 'Idempotency-Key': idem },
+      body: { userId: 'u1', type: 'note', payload: 'x' },
+    });
+    const b = await postJson(`${base}/v1/signals`, {
+      headers: { 'x-api-key': 'k', 'Idempotency-Key': idem },
+      body: { userId: 'u1', type: 'note', payload: 'x' },
+    });
+
+    assert.equal(a.statusCode, 201);
+    assert.equal(b.statusCode, 200);
+    assert.equal(a.body.id, b.body.id);
+    assert.equal(a.body.idempotencyKey, b.body.idempotencyKey);
+  } finally {
+    stopServer(proc);
+  }
 });
 
-async function postJson(url, { headers, body }){
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify(body);
-    const req = http.request(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers } }, (res) => {
-      let chunks=''; res.on('data', d => chunks+=d);
-      res.on('end', () => resolve(JSON.parse(chunks||'{}')));
-    });
-    req.on('error', reject);
-    req.write(data); req.end();
+test('concurrent idempotent requests create only one signal', async () => {
+  const port = '9093';
+  const proc = await startServer({
+    API_KEY: 'k',
+    PORT: port,
+    DATABASE_URL: tempDb('idempotency-concurrent'),
+    RATE_LIMIT_PER_MIN: '100',
   });
-}
+
+  try {
+    const base = `http://localhost:${port}`;
+    const requests = Array.from({ length: 25 }, () =>
+      postJson(`${base}/v1/signals`, {
+        headers: { 'x-api-key': 'k', 'Idempotency-Key': 'parallel-key' },
+        body: { userId: 'u2', type: 'note', payload: 'x' },
+      }),
+    );
+
+    const responses = await Promise.all(requests);
+    const ids = new Set(responses.map((r) => r.body.id));
+
+    assert.deepEqual(new Set(responses.map((r) => r.statusCode)), new Set([200, 201]));
+    assert.equal(ids.size, 1);
+
+    const listed = await getJson(`${base}/v1/signals?userId=u2&limit=10`, {
+      headers: { 'x-api-key': 'k' },
+    });
+
+    assert.equal(listed.statusCode, 200);
+    assert.equal(listed.body.items.length, 1);
+  } finally {
+    stopServer(proc);
+  }
+});
